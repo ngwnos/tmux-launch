@@ -1,0 +1,41 @@
+# Example project list for tmux-launch.
+# One project per line.
+# Blank lines and lines starting with "#" are ignored.
+#
+# Each entry can be either:
+# 1) An absolute path to a .tmuxp file
+# 2) A project directory path containing a .tmuxp file
+
+# Example workflow:
+# 1) Put a `.tmuxp` file in your project folder.
+# 2) Add either the `.tmuxp` path or the project folder path to this manifest.
+#
+# Example `.tmuxp` content:
+# {
+#   "session": "<your-project-name>",
+#   "root": "<absolute-path-to-your-project>",
+#   "windows": [
+#     {
+#       "name": "<your-project-name>",
+#       "layout": "vertical",
+#       "panes": [
+#         {
+#           "name": "start",
+#           "percent": 10,
+#           "command": "bun run dev",
+#           "cwd": "."
+#         },
+#         {
+#           "name": "codex",
+#           "percent": 90,
+#           "command": "codex resume",
+#           "cwd": "."
+#         }
+#       ]
+#     }
+#   ]
+# }
+
+/absolute/path/to/your-project/.tmuxp
+/absolute/path/to/another-project
+~/path/to/a-project/.tmuxp

@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# tmux-launch
+# - Reads project entries from TMUX_PROJECT_LIST_FILE (default ~/.tmuxp-projects)
+# - Each entry is either: /path/to/.tmuxp OR /path/to/project (containing .tmuxp)
+# - Launch behavior: attach existing session, otherwise create from .tmuxp
+# Usage:
+#   tmux-launch
+#   tmux-launch <project-name|project-path|session-name>
+
+MANIFEST_NAME="${TMUX_PROJECT_MANIFEST:-.tmuxp}"
+TMUX_BIN="${TMUX_BIN:-tmux}"
+TMUX_PROJECT_LIST="${TMUX_PROJECT_LIST_FILE:-$HOME/.tmuxp-projects}"
+if ! command -v "$TMUX_BIN" >/dev/null; then
+  echo "tmux not found" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null; then
+  echo "jq not found (required to read .tmuxp files)" >&2
+  exit 1
+fi
+
+run_in_pane() {
+  local pane_id="$1"
+  local pane_name="$2"
+  local pane_cwd="$3"
+  local command="$4"
+  local startup_cmd
+  local escaped_cwd
+
+  escaped_cwd="$(printf '%q' "$pane_cwd")"
+
+  if [[ -z "$command" || "$command" == "null" ]]; then
+    startup_cmd="exec bash -i"
+  else
+    startup_cmd="${command}; exec bash -i"
+  fi
+
+  # Start pane commands without send-keys typing artifacts.
+  "$TMUX_BIN" respawn-pane -k -t "$pane_id" "cd $escaped_cwd; $startup_cmd"
+}
+
+normalize_percent() {
+  local raw="$1"
+  local normalized
+
+  # Accept values like "10" or "10%"; clamp to tmux-safe range.
+  normalized="${raw//[^0-9]/}"
+  if [[ -z "$normalized" ]]; then
+    return 1
+  fi
+  if [[ ! "$normalized" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+
+  if (( normalized < 1 )); then
+    return 1
+  fi
+  if (( normalized > 99 )); then
+    normalized=99
+  fi
+
+  printf '%s\n' "$normalized"
+}
+
+normalize_split_option() {
+  local raw="$1"
+  local default_option="$2"
+
+  if [[ -z "$raw" || "$raw" == "null" ]]; then
+    printf '%s\n' "$default_option"
+    return 0
+  fi
+
+  raw="${raw,,}"
+  case "$raw" in
+    "-h"|"h"|"horizontal"|"left-right")
+      printf '%s\n' "-h"
+      ;;
+    "-v"|"v"|"vertical"|"top-bottom")
+      printf '%s\n' "-v"
+      ;;
+    *)
+      echo "Invalid split value '$raw'. Use horizontal/vertical (or h/v)." >&2
+      return 1
+      ;;
+  esac
+}
+
+resolve_path() {
+  local path="$1"
+  local project_list_dir
+
+  # Relative entries are resolved from the manifest file directory.
+  case "$path" in
+    "~"/*)
+      printf '%s\n' "${HOME}${path#\~}"
+      ;;
+    /*)
+      printf '%s\n' "$path"
+      ;;
+    *)
+      project_list_dir="$(cd "$(dirname "$TMUX_PROJECT_LIST")" && pwd -P)"
+      printf '%s\n' "$project_list_dir/$path"
+      ;;
+  esac
+}
+
+setup_window() {
+  local session_name="$1"
+  local project_root="$2"
+  local window_json="$3"
+  local window_index="$4"
+
+  local window_name
+  local layout
+  local split_option
+  local base_pane
+  local -a pane_defs
+  local -a pane_ids pane_names
+  local -A pane_ids_by_name
+  local i
+
+  # Window default: first window gets the session name.
+  window_name="$(jq -r '.name // empty' <<<"$window_json")"
+  if [[ -z "$window_name" || "$window_name" == "null" ]]; then
+    if (( window_index == 0 )); then
+      window_name="$session_name"
+    else
+      window_name="window-$((window_index + 1))"
+    fi
+  fi
+
+  layout="$(jq -r '.layout // "vertical"' <<<"$window_json")"
+  if [[ "$layout" == "null" || -z "$layout" ]]; then
+    layout="vertical"
+  fi
+  layout="${layout,,}"
+  case "$layout" in
+    *horizontal*) split_option="-h" ;;
+    *) split_option="-v" ;;
+  esac
+
+  mapfile -t pane_defs < <(jq -c '.panes // [] | .[]' <<<"$window_json")
+  # Fallback if panes are omitted in .tmuxp.
+  if (( ${#pane_defs[@]} == 0 )); then
+    mapfile -t pane_defs < <(jq -nc '[
+      {name:"start", percent:10, command:"bun run dev", cwd:"."},
+      {name:"codex", percent:90, command:"codex resume", cwd:"."}
+    ] | .[]')
+  fi
+
+  if (( window_index == 0 )); then
+    # First window creates the session.
+    base_pane=$("$TMUX_BIN" new-session -d -s "$session_name" -n "$window_name" -c "$project_root" -P -F '#{pane_id}' "bash")
+  else
+    base_pane=$("$TMUX_BIN" new-window -d -t "$session_name" -n "$window_name" -c "$project_root" -P -F '#{pane_id}' "bash")
+  fi
+
+  for (( i = 0; i < ${#pane_defs[@]}; i++ )); do
+    local pane_json="${pane_defs[$i]}"
+    local pane_name
+    local percent
+    local command
+    local pane_cwd
+    local pane_split
+    local pane_target
+    local pane_id
+    local target_pane
+    local pane_split_args
+
+    pane_name="$(jq -r '.name // empty' <<<"$pane_json")"
+    if [[ -z "$pane_name" || "$pane_name" == "null" ]]; then
+      pane_name="pane-$((i + 1))"
+    fi
+
+    percent="$(jq -r '.percent // empty' <<<"$pane_json")"
+    command="$(jq -r '.command // empty' <<<"$pane_json")"
+    pane_cwd="$(jq -r '.cwd // empty' <<<"$pane_json")"
+    pane_split="$(jq -r '.split // empty' <<<"$pane_json")"
+    pane_target="$(jq -r '.target // empty' <<<"$pane_json")"
+
+    if [[ -z "$pane_cwd" || "$pane_cwd" == "null" ]]; then
+      pane_cwd="."
+    fi
+    if [[ "$pane_cwd" != /* ]]; then
+      pane_cwd="$project_root/$pane_cwd"
+    fi
+    if [[ ! -d "$pane_cwd" ]]; then
+      echo "Pane cwd does not exist in '$window_name/$pane_name': $pane_cwd" >&2
+      exit 1
+    fi
+    pane_cwd="$(cd "$pane_cwd" && pwd -P)"
+
+    if (( i == 0 )); then
+      # First pane reuses the base pane from new-session/new-window.
+      pane_id="$base_pane"
+    else
+      local pane_percent
+      local split_size
+      pane_split="$(normalize_split_option "$pane_split" "$split_option")"
+      pane_split_args=("$pane_split")
+
+      # target can be omitted (previous pane), 1-based numeric index, or pane name.
+      if [[ -z "$pane_target" || "$pane_target" == "null" ]]; then
+        target_pane="${pane_ids[$((i - 1))]}"
+      elif [[ "$pane_target" =~ ^[0-9]+$ ]]; then
+        if (( pane_target >= 1 && pane_target <= ${#pane_ids[@]} )); then
+          target_pane="${pane_ids[$((pane_target - 1))]}"
+        else
+          echo "Invalid numeric target '$pane_target' in '$window_name/$pane_name'." >&2
+          exit 1
+        fi
+      elif [[ -n "${pane_ids_by_name[$pane_target]:-}" ]]; then
+        target_pane="${pane_ids_by_name[$pane_target]}"
+      else
+        echo "Unknown target pane '$pane_target' in '$window_name/$pane_name'." >&2
+        exit 1
+      fi
+
+      pane_percent="$(normalize_percent "$percent" || true)"
+      if [[ -n "$pane_percent" ]]; then
+        local dimension
+        if [[ "$pane_split" == "-v" ]]; then
+          dimension="$("$TMUX_BIN" display-message -p -t "$target_pane" '#{pane_height}' 2>/tmp/tmux-launch-dim.err || true)"
+        else
+          dimension="$("$TMUX_BIN" display-message -p -t "$target_pane" '#{pane_width}' 2>/tmp/tmux-launch-dim.err || true)"
+        fi
+        if [[ ! "$dimension" =~ ^[0-9]+$ ]]; then
+          if [[ -s /tmp/tmux-launch-dim.err ]]; then
+            cat /tmp/tmux-launch-dim.err >&2
+            rm -f /tmp/tmux-launch-dim.err
+          fi
+          dimension=""
+        fi
+        rm -f /tmp/tmux-launch-dim.err
+        if [[ -z "$dimension" ]]; then
+          split_size=
+        else
+          # Use absolute split size (-l) because -p is unreliable on some tmux builds.
+          split_size=$(( dimension * pane_percent / 100 ))
+          if (( split_size < 1 )); then
+            split_size=1
+          fi
+          if (( split_size >= dimension )); then
+            split_size=$((dimension - 1))
+          fi
+          pane_split_args+=("-l" "$split_size")
+        fi
+      else
+        pane_split_args=("${pane_split_args[0]}")
+      fi
+
+      pane_id=$("$TMUX_BIN" split-window -d "${pane_split_args[@]}" -t "$target_pane" -c "$pane_cwd" -P -F '#{pane_id}' "bash")
+    fi
+
+    "$TMUX_BIN" select-pane -t "$pane_id" -T "$pane_name"
+    run_in_pane "$pane_id" "$pane_name" "$pane_cwd" "$command"
+    pane_ids+=("$pane_id")
+    pane_names+=("$pane_name")
+    pane_ids_by_name["$pane_name"]="$pane_id"
+  done
+
+  if [[ "$layout" != "vertical" && "$layout" != "horizontal" ]]; then
+    "$TMUX_BIN" select-layout -t "$session_name:$window_name" "$layout" || true
+  fi
+}
+
+select_project() {
+  local query="${1:-}"
+
+  # Returns one manifest path on stdout. Selection UI goes to stderr.
+  if [[ ! -f "$TMUX_PROJECT_LIST" ]]; then
+    echo "Project list file not found: $TMUX_PROJECT_LIST" >&2
+    echo "Add .tmuxp project paths there and run again." >&2
+    exit 1
+  fi
+
+  mapfile -t MANIFEST_ENTRIES < <(sed -E 's/[[:space:]]+$//; /^[[:space:]]*($|#)/d; s/^[[:space:]]+//' "$TMUX_PROJECT_LIST")
+  if (( ${#MANIFEST_ENTRIES[@]} == 0 )); then
+    echo "No entries found in project list: $TMUX_PROJECT_LIST" >&2
+    exit 1
+  fi
+
+  mapfile -t MANIFESTS < <(
+    for entry in "${MANIFEST_ENTRIES[@]}"; do
+      resolved="$(resolve_path "$entry")"
+      if [[ "$resolved" == *"/$MANIFEST_NAME" ]]; then
+        echo "$resolved"
+      elif [[ -f "$resolved/$MANIFEST_NAME" ]]; then
+        echo "$resolved/$MANIFEST_NAME"
+      else
+        continue
+      fi
+    done
+  )
+  if (( ${#MANIFESTS[@]} == 0 )); then
+    echo "No readable '$MANIFEST_NAME' manifests in project list: $TMUX_PROJECT_LIST" >&2
+    exit 1
+  fi
+
+  local -a PROJECT_DIRS PROJECT_NAMES PROJECT_SESSIONS PROJECT_STATES
+  local i
+  for i in "${!MANIFESTS[@]}"; do
+    local dir
+    local session_name_for_project
+    dir="$(dirname "${MANIFESTS[$i]}")"
+    PROJECT_DIRS[i]="$(cd "$dir" && pwd -P)"
+    PROJECT_NAMES[i]="$(basename "${PROJECT_DIRS[i]}")"
+    session_name_for_project="$(jq -r '.session // empty' "${MANIFESTS[$i]}" 2>/dev/null || true)"
+    if [[ -z "$session_name_for_project" || "$session_name_for_project" == "null" ]]; then
+      session_name_for_project="${PROJECT_NAMES[$i]}"
+    fi
+    PROJECT_SESSIONS[i]="$session_name_for_project"
+    if "$TMUX_BIN" has-session -t "$session_name_for_project" 2>/dev/null; then
+      PROJECT_STATES[i]="open"
+    else
+      PROJECT_STATES[i]="new"
+    fi
+  done
+
+  if [[ -n "$query" ]]; then
+    for i in "${!PROJECT_NAMES[@]}"; do
+      if [[ "${PROJECT_NAMES[$i]}" == "$query" || "${PROJECT_DIRS[$i]}" == "$query" || "${PROJECT_SESSIONS[$i]}" == "$query" ]]; then
+        echo "${MANIFESTS[$i]}"
+        return 0
+      fi
+    done
+
+    for i in "${!PROJECT_NAMES[@]}"; do
+      if [[ "${PROJECT_NAMES[$i],,}" == *"${query,,}"* ]]; then
+        echo "${MANIFESTS[$i]}"
+        return 0
+      fi
+    done
+
+    echo "No project matched '$query'." >&2
+    exit 1
+  fi
+
+  if command -v fzf >/dev/null 2>&1; then
+    # fzf line format: index<TAB>[state]<TAB>name<TAB>path
+    local choice
+    choice="$((
+      for i in "${!PROJECT_NAMES[@]}"; do
+        printf '%d\t[%s]\t%s\t%s\n' "$((i + 1))" "${PROJECT_STATES[$i]}" "${PROJECT_NAMES[$i]}" "${PROJECT_DIRS[$i]}"
+      done
+    ) | fzf --prompt='Select a project: ' --height=12 --layout=reverse --with-nth=2,3,4 --delimiter='\t')"
+
+    if [[ -z "$choice" ]]; then
+      echo "No project selected." >&2
+      exit 1
+    fi
+
+    local selected_index
+    selected_index="${choice%%$'\t'*}"
+    if [[ ! "$selected_index" =~ ^[0-9]+$ ]] || (( selected_index < 1 || selected_index > ${#PROJECT_NAMES[@]} )); then
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+
+    echo "${MANIFESTS[$((selected_index - 1))]}"
+    return 0
+  fi
+
+  echo "Projects with $MANIFEST_NAME:" >&2
+  for i in "${!PROJECT_NAMES[@]}"; do
+    printf ' %2d) [%s] %s (%s)\n' "$((i + 1))" "${PROJECT_STATES[$i]}" "${PROJECT_NAMES[$i]}" "${PROJECT_DIRS[$i]}" >&2
+  done
+
+  while true; do
+    local selection=""
+    read -r -p "Select a project (number): " selection
+    if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#PROJECT_NAMES[@]} )); then
+      echo "${MANIFESTS[$((selection - 1))]}"
+      return 0
+    fi
+    echo "Invalid selection." >&2
+  done
+}
+
+SESSION_NAME_FROM_MANIFESTS=$(select_project "${1:-}")
+if [[ -z "$SESSION_NAME_FROM_MANIFESTS" ]]; then
+  exit 1
+fi
+
+manifest_path="$SESSION_NAME_FROM_MANIFESTS"
+project_root="$(cd "$(dirname "$manifest_path")" && pwd -P)"
+
+session_name="$(jq -r '.session // empty' "$manifest_path")"
+if [[ -z "$session_name" || "$session_name" == "null" ]]; then
+  session_name="$(basename "$project_root")"
+fi
+
+LAUNCH_SESSION_NAME="$session_name"
+SESSION_CREATED=0
+cleanup_bad_session() {
+  if (( SESSION_CREATED == 1 )) && "$TMUX_BIN" has-session -t "$LAUNCH_SESSION_NAME" 2>/dev/null; then
+    "$TMUX_BIN" kill-session -t "$LAUNCH_SESSION_NAME" >/dev/null 2>&1 || true
+  fi
+}
+
+if "$TMUX_BIN" has-session -t "$session_name" 2>/dev/null; then
+  # Fast path: session already exists, just switch/attach.
+  if [[ -n "${TMUX:-}" ]]; then
+    "$TMUX_BIN" switch-client -t "$session_name"
+  else
+    "$TMUX_BIN" attach -t "$session_name"
+  fi
+  exit 0
+fi
+
+configured_root="$(jq -r '.root // empty' "$manifest_path")"
+if [[ -n "$configured_root" && "$configured_root" != "null" ]]; then
+  if [[ "$configured_root" == "~/"* ]]; then
+    configured_root="${HOME}${configured_root#\~}"
+  elif [[ "$configured_root" != /* ]]; then
+    configured_root="$project_root/$configured_root"
+  fi
+  if [[ ! -d "$configured_root" ]]; then
+    echo "Configured root does not exist for '$session_name': $configured_root" >&2
+    exit 1
+  fi
+  project_root="$(cd "$configured_root" && pwd -P)"
+fi
+
+window_count="$(jq '.windows | length' "$manifest_path" 2>/dev/null || echo 0)"
+mapfile -t windows < <(jq -c '(.windows // [])[]' "$manifest_path")
+if (( window_count == 0 || ${#windows[@]} == 0 )); then
+  # Fallback layout if windows are omitted in .tmuxp.
+  windows=("$(
+    jq -nc --arg name "$session_name" '{name:$name, layout:"vertical", panes:[{name:"start", percent:10, command:"bun run dev", cwd:"."}, {name:"codex", percent:90, command:"codex resume", cwd:"."}]}'
+  )")
+fi
+
+trap 'cleanup_bad_session' ERR
+SESSION_CREATED=1
+for (( i = 0; i < ${#windows[@]}; i++ )); do
+  setup_window "$session_name" "$project_root" "${windows[$i]}" "$i"
+done
+trap - ERR
+
+if [[ -n "${TMUX:-}" ]]; then
+  "$TMUX_BIN" switch-client -t "$session_name"
+else
+  "$TMUX_BIN" attach -t "$session_name"
+fi
