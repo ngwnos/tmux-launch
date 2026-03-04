@@ -27,19 +27,16 @@ run_in_pane() {
   local pane_name="$2"
   local pane_cwd="$3"
   local command="$4"
-  local startup_cmd
-  local escaped_cwd
 
-  escaped_cwd="$(printf '%q' "$pane_cwd")"
+  # Always start an interactive shell as the pane process.
+  "$TMUX_BIN" respawn-pane -k -t "$pane_id" -c "$pane_cwd" "exec bash -i"
 
-  if [[ -z "$command" || "$command" == "null" ]]; then
-    startup_cmd="exec bash -i"
-  else
-    startup_cmd="${command}; exec bash -i"
+  if [[ -n "$command" && "$command" != "null" ]]; then
+    # Queue startup command as if typed at the prompt so Ctrl+C interrupts only
+    # the foreground app and returns to this shell.
+    "$TMUX_BIN" send-keys -t "$pane_id" -l "$command"
+    "$TMUX_BIN" send-keys -t "$pane_id" Enter
   fi
-
-  # Start pane commands without send-keys typing artifacts.
-  "$TMUX_BIN" respawn-pane -k -t "$pane_id" "cd $escaped_cwd; $startup_cmd"
 }
 
 normalize_percent() {
@@ -330,7 +327,7 @@ select_project() {
     done
 
     for i in "${!PROJECT_NAMES[@]}"; do
-      if [[ "${PROJECT_NAMES[$i],,}" == *"${query,,}"* ]]; then
+      if [[ "${PROJECT_NAMES[$i],,}" == *"${query,,}"* || "${PROJECT_SESSIONS[$i],,}" == *"${query,,}"* ]]; then
         echo "${MANIFESTS[$i]}"
         return 0
       fi
@@ -341,11 +338,11 @@ select_project() {
   fi
 
   if command -v fzf >/dev/null 2>&1; then
-    # fzf line format: index<TAB>[state]<TAB>name<TAB>path
+    # fzf line format: index<TAB>[state]<TAB>session<TAB>path
     local choice
     choice="$((
       for i in "${!PROJECT_NAMES[@]}"; do
-        printf '%d\t[%s]\t%s\t%s\n' "$((i + 1))" "${PROJECT_STATES[$i]}" "${PROJECT_NAMES[$i]}" "${PROJECT_DIRS[$i]}"
+        printf '%d\t[%s]\t%s\t%s\n' "$((i + 1))" "${PROJECT_STATES[$i]}" "${PROJECT_SESSIONS[$i]}" "${PROJECT_DIRS[$i]}"
       done
     ) | fzf --prompt='Select a project: ' --height=12 --layout=reverse --with-nth=2,3,4 --delimiter='\t')"
 
@@ -367,7 +364,7 @@ select_project() {
 
   echo "Projects with $MANIFEST_NAME:" >&2
   for i in "${!PROJECT_NAMES[@]}"; do
-    printf ' %2d) [%s] %s (%s)\n' "$((i + 1))" "${PROJECT_STATES[$i]}" "${PROJECT_NAMES[$i]}" "${PROJECT_DIRS[$i]}" >&2
+    printf ' %2d) [%s] %s (%s)\n' "$((i + 1))" "${PROJECT_STATES[$i]}" "${PROJECT_SESSIONS[$i]}" "${PROJECT_DIRS[$i]}" >&2
   done
 
   while true; do
