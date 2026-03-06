@@ -12,6 +12,7 @@ set -euo pipefail
 MANIFEST_NAME="${TMUX_PROJECT_MANIFEST:-.tmuxp}"
 TMUX_BIN="${TMUX_BIN:-tmux}"
 TMUX_PROJECT_LIST="${TMUX_PROJECT_LIST_FILE:-$HOME/.tmuxp-projects}"
+TMUX_PROJECT_STATE_FILE="${TMUX_PROJECT_STATE_FILE:-${TMUX_PROJECT_LIST}.state}"
 if ! command -v "$TMUX_BIN" >/dev/null; then
   echo "tmux not found" >&2
   exit 1
@@ -103,6 +104,82 @@ resolve_path() {
       printf '%s\n' "$project_list_dir/$path"
       ;;
   esac
+}
+
+load_project_state() {
+  local manifest_path
+  local timestamp
+
+  declare -gA PROJECT_LAST_LAUNCHED=()
+  if [[ ! -f "$TMUX_PROJECT_STATE_FILE" ]]; then
+    return 0
+  fi
+
+  while IFS=$'\t' read -r manifest_path timestamp; do
+    if [[ -n "$manifest_path" && "$timestamp" =~ ^[0-9]+$ ]]; then
+      PROJECT_LAST_LAUNCHED["$manifest_path"]="$timestamp"
+    fi
+  done <"$TMUX_PROJECT_STATE_FILE"
+}
+
+sort_projects_by_recent_launch() {
+  local tmp_file
+  local i
+  local timestamp
+  local original_index
+  local manifest_path
+  local project_dir
+  local project_name
+  local session_name
+  local project_state
+  local -a sorted_manifests sorted_dirs sorted_names sorted_sessions sorted_states
+
+  tmp_file="$(mktemp "${TMPDIR:-/tmp}/tmux-launch-order.XXXXXX")"
+  for i in "${!MANIFESTS[@]}"; do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${PROJECT_LAST_LAUNCHED[${MANIFESTS[$i]}]:-0}" \
+      "$i" \
+      "${MANIFESTS[$i]}" \
+      "${PROJECT_DIRS[$i]}" \
+      "${PROJECT_NAMES[$i]}" \
+      "${PROJECT_SESSIONS[$i]}" \
+      "${PROJECT_STATES[$i]}"
+  done | sort -t $'\t' -k1,1nr -k2,2n >"$tmp_file"
+
+  while IFS=$'\t' read -r timestamp original_index manifest_path project_dir project_name session_name project_state; do
+    sorted_manifests+=("$manifest_path")
+    sorted_dirs+=("$project_dir")
+    sorted_names+=("$project_name")
+    sorted_sessions+=("$session_name")
+    sorted_states+=("$project_state")
+  done <"$tmp_file"
+  rm -f "$tmp_file"
+
+  MANIFESTS=("${sorted_manifests[@]}")
+  PROJECT_DIRS=("${sorted_dirs[@]}")
+  PROJECT_NAMES=("${sorted_names[@]}")
+  PROJECT_SESSIONS=("${sorted_sessions[@]}")
+  PROJECT_STATES=("${sorted_states[@]}")
+}
+
+record_project_launch() {
+  local manifest_path="$1"
+  local timestamp
+  local state_dir
+  local tmp_file
+  local key
+
+  load_project_state
+  timestamp="$(date +%s)"
+  PROJECT_LAST_LAUNCHED["$manifest_path"]="$timestamp"
+
+  state_dir="$(dirname "$TMUX_PROJECT_STATE_FILE")"
+  mkdir -p "$state_dir"
+  tmp_file="$(mktemp "$state_dir/.tmux-launch-state.XXXXXX")"
+  for key in "${!PROJECT_LAST_LAUNCHED[@]}"; do
+    printf '%s\t%s\n' "$key" "${PROJECT_LAST_LAUNCHED[$key]}"
+  done | sort -t $'\t' -k1,1 >"$tmp_file"
+  mv "$tmp_file" "$TMUX_PROJECT_STATE_FILE"
 }
 
 setup_window() {
@@ -318,6 +395,9 @@ select_project() {
     fi
   done
 
+  load_project_state
+  sort_projects_by_recent_launch
+
   if [[ -n "$query" ]]; then
     for i in "${!PROJECT_NAMES[@]}"; do
       if [[ "${PROJECT_NAMES[$i]}" == "$query" || "${PROJECT_DIRS[$i]}" == "$query" || "${PROJECT_SESSIONS[$i]}" == "$query" ]]; then
@@ -344,7 +424,7 @@ select_project() {
       for i in "${!PROJECT_NAMES[@]}"; do
         printf '%d\t[%s]\t%s\t%s\n' "$((i + 1))" "${PROJECT_STATES[$i]}" "${PROJECT_SESSIONS[$i]}" "${PROJECT_DIRS[$i]}"
       done
-    ) | fzf --prompt='Select a project: ' --height=12 --layout=reverse --with-nth=2,3,4 --delimiter='\t')"
+    ) | fzf --prompt='Select a project: ' --height='~100%' --min-height=10 --layout=reverse --cycle --with-nth=2,3,4 --delimiter='\t')"
 
     if [[ -z "$choice" ]]; then
       echo "No project selected." >&2
@@ -401,6 +481,7 @@ cleanup_bad_session() {
 
 if "$TMUX_BIN" has-session -t "$session_name" 2>/dev/null; then
   # Fast path: session already exists, just switch/attach.
+  record_project_launch "$manifest_path"
   if [[ -n "${TMUX:-}" ]]; then
     "$TMUX_BIN" switch-client -t "$session_name"
   else
@@ -439,6 +520,7 @@ for (( i = 0; i < ${#windows[@]}; i++ )); do
 done
 trap - ERR
 
+record_project_launch "$manifest_path"
 if [[ -n "${TMUX:-}" ]]; then
   "$TMUX_BIN" switch-client -t "$session_name"
 else

@@ -26,10 +26,14 @@ tmux-launch <project-name|project-path|session-name>
 ## Manifest
 
 - Default manifest file: `~/.tmuxp-projects`
+- Default recency state file: `~/.tmuxp-projects.state`
 - One entry per line
 - Each entry is either:
 - absolute path to a `.tmuxp` file
 - project directory containing `.tmuxp`
+- `tmux-launch` keeps the manifest as a plain list and stores last-launched
+  timestamps in the separate state file so the picker can sort projects by
+  recency.
 
 ## Minimal `.tmuxp` example
 
