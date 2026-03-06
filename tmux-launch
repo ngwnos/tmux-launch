@@ -8,6 +8,7 @@ set -euo pipefail
 # Usage:
 #   tmux-launch
 #   tmux-launch <project-name|project-path|session-name>
+#   tmux-launch status [project-name|project-path|session-name]
 
 MANIFEST_NAME="${TMUX_PROJECT_MANIFEST:-.tmuxp}"
 TMUX_BIN="${TMUX_BIN:-tmux}"
@@ -106,6 +107,64 @@ resolve_path() {
   esac
 }
 
+load_projects() {
+  if [[ ! -f "$TMUX_PROJECT_LIST" ]]; then
+    echo "Project list file not found: $TMUX_PROJECT_LIST" >&2
+    echo "Add .tmuxp project paths there and run again." >&2
+    return 1
+  fi
+
+  local -a manifest_entries
+  local i
+  mapfile -t manifest_entries < <(sed -E 's/[[:space:]]+$//; /^[[:space:]]*($|#)/d; s/^[[:space:]]+//' "$TMUX_PROJECT_LIST")
+  if (( ${#manifest_entries[@]} == 0 )); then
+    echo "No entries found in project list: $TMUX_PROJECT_LIST" >&2
+    return 1
+  fi
+
+  declare -ga MANIFESTS=()
+  mapfile -t MANIFESTS < <(
+    for entry in "${manifest_entries[@]}"; do
+      resolved=""
+      resolved="$(resolve_path "$entry")"
+      if [[ "$resolved" == *"/$MANIFEST_NAME" ]]; then
+        echo "$resolved"
+      elif [[ -f "$resolved/$MANIFEST_NAME" ]]; then
+        echo "$resolved/$MANIFEST_NAME"
+      fi
+    done
+  )
+  if (( ${#MANIFESTS[@]} == 0 )); then
+    echo "No readable '$MANIFEST_NAME' manifests in project list: $TMUX_PROJECT_LIST" >&2
+    return 1
+  fi
+
+  declare -ga PROJECT_DIRS=()
+  declare -ga PROJECT_NAMES=()
+  declare -ga PROJECT_SESSIONS=()
+  declare -ga PROJECT_STATES=()
+  for i in "${!MANIFESTS[@]}"; do
+    local dir
+    local session_name_for_project
+    dir="$(dirname "${MANIFESTS[$i]}")"
+    PROJECT_DIRS[i]="$(cd "$dir" && pwd -P)"
+    PROJECT_NAMES[i]="$(basename "${PROJECT_DIRS[i]}")"
+    session_name_for_project="$(jq -r '.session // empty' "${MANIFESTS[$i]}" 2>/dev/null || true)"
+    if [[ -z "$session_name_for_project" || "$session_name_for_project" == "null" ]]; then
+      session_name_for_project="${PROJECT_NAMES[$i]}"
+    fi
+    PROJECT_SESSIONS[i]="$session_name_for_project"
+    if "$TMUX_BIN" has-session -t "=$session_name_for_project" 2>/dev/null; then
+      PROJECT_STATES[i]="open"
+    else
+      PROJECT_STATES[i]="new"
+    fi
+  done
+
+  load_project_state
+  sort_projects_by_recent_launch
+}
+
 load_project_state() {
   local manifest_path
   local timestamp
@@ -182,6 +241,277 @@ record_project_launch() {
   mv "$tmp_file" "$TMUX_PROJECT_STATE_FILE"
 }
 
+resolve_project_root() {
+  local manifest_path="$1"
+  local project_root="$2"
+  local configured_root
+
+  configured_root="$(jq -r '.root // empty' "$manifest_path")"
+  if [[ -n "$configured_root" && "$configured_root" != "null" ]]; then
+    if [[ "$configured_root" == "~/"* ]]; then
+      configured_root="${HOME}${configured_root#\~}"
+    elif [[ "$configured_root" != /* ]]; then
+      configured_root="$project_root/$configured_root"
+    fi
+    if [[ ! -d "$configured_root" ]]; then
+      echo "Configured root does not exist for '$manifest_path': $configured_root" >&2
+      return 1
+    fi
+    project_root="$(cd "$configured_root" && pwd -P)"
+  fi
+
+  printf '%s\n' "$project_root"
+}
+
+run_status_command() {
+  local manifest_path="$1"
+  local project_root="$2"
+  local session_name="$3"
+  local status_command
+
+  status_command="$(jq -r '.status_command // empty' "$manifest_path")"
+  if [[ -z "$status_command" || "$status_command" == "null" ]]; then
+    echo "No status_command configured for '$session_name'." >&2
+    return 1
+  fi
+
+  (
+    cd "$project_root"
+    export TMUX_LAUNCH_SESSION="$session_name"
+    export TMUX_LAUNCH_ROOT="$project_root"
+    export TMUX_LAUNCH_MANIFEST="$manifest_path"
+    export TMUX_LAUNCH_PROJECT_LIST="$TMUX_PROJECT_LIST"
+    export TMUX_LAUNCH_PROJECT_STATE_FILE="$TMUX_PROJECT_STATE_FILE"
+    exec bash -lc "$status_command"
+  )
+}
+
+choose_status_pane_pid() {
+  local session_name="$1"
+  local panes_output
+  local pane_id
+  local pane_pid
+  local pane_command
+  local pane_title
+  local first_pid=""
+  local bun_pid=""
+
+  if ! panes_output="$("$TMUX_BIN" list-panes -t "=$session_name" -F '#{pane_id}|#{pane_pid}|#{pane_current_command}|#{pane_title}' 2>/dev/null)"; then
+    echo "Session $session_name is not running."
+    return 1
+  fi
+
+  while IFS='|' read -r pane_id pane_pid pane_command pane_title; do
+    [[ -n "$pane_pid" ]] || continue
+    if [[ -z "$first_pid" ]]; then
+      first_pid="$pane_pid"
+    fi
+    if [[ "$pane_title" == "start" ]]; then
+      printf '%s\n' "$pane_pid"
+      return 0
+    fi
+    if [[ -z "$bun_pid" && "$pane_command" == "bun" ]]; then
+      bun_pid="$pane_pid"
+    fi
+  done <<<"$panes_output"
+
+  if [[ -n "$bun_pid" ]]; then
+    printf '%s\n' "$bun_pid"
+    return 0
+  fi
+  if [[ -n "$first_pid" ]]; then
+    printf '%s\n' "$first_pid"
+    return 0
+  fi
+
+  echo "Session $session_name has no panes."
+  return 1
+}
+
+descendant_pids() {
+  local root_pid="$1"
+  local pid
+  local ppid
+  local idx=0
+  local current_pid
+  local child_pid
+  local line
+  local -a queue=("$root_pid")
+  local -A children_by_parent=()
+  local -A seen=()
+
+  seen["$root_pid"]=1
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "$line" ]] || continue
+    read -r pid ppid <<<"$line"
+    [[ "$pid" =~ ^[0-9]+$ && "$ppid" =~ ^[0-9]+$ ]] || continue
+    children_by_parent["$ppid"]+="${children_by_parent[$ppid]:+ }$pid"
+  done < <(ps -eo pid=,ppid=)
+
+  while (( idx < ${#queue[@]} )); do
+    current_pid="${queue[$idx]}"
+    ((idx += 1))
+    for child_pid in ${children_by_parent[$current_pid]:-}; do
+      if [[ -z "${seen[$child_pid]:-}" ]]; then
+        seen["$child_pid"]=1
+        queue+=("$child_pid")
+      fi
+    done
+  done
+
+  printf '%s\n' "${!seen[@]}"
+}
+
+normalize_status_url_host() {
+  local host="$1"
+
+  case "$host" in
+    "*"|"0.0.0.0"|"[::]"|"::")
+      printf '127.0.0.1\n'
+      ;;
+    \[*\])
+      printf '%s\n' "${host:1:${#host}-2}"
+      ;;
+    *)
+      printf '%s\n' "$host"
+      ;;
+  esac
+}
+
+run_builtin_status_vite_bun() {
+  local session_name="$1"
+  local root_pid
+  local local_addr
+  local host
+  local port
+  local rest
+  local pid
+  local line
+  local -a listeners=()
+  local -A session_pids=()
+
+  if ! root_pid="$(choose_status_pane_pid "$session_name")"; then
+    printf '%s\n' "$root_pid"
+    return 0
+  fi
+
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    session_pids["$pid"]=1
+  done < <(descendant_pids "$root_pid")
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r _ _ _ local_addr _ <<<"$line"
+    host="${local_addr%:*}"
+    port="${local_addr##*:}"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+
+    rest="$line"
+    while [[ "$rest" =~ pid=([0-9]+) ]]; do
+      pid="${BASH_REMATCH[1]}"
+      if [[ -n "${session_pids[$pid]:-}" ]]; then
+        listeners+=("$(normalize_status_url_host "$host"):$port")
+        break
+      fi
+      rest="${rest#*pid=$pid}"
+    done
+  done < <(ss -ltnpH 2>/dev/null)
+
+  if (( ${#listeners[@]} == 0 )); then
+    echo "No listening ports found for $session_name."
+    return 0
+  fi
+
+  mapfile -t listeners < <(printf '%s\n' "${listeners[@]}" | sort -u -t : -k2,2n)
+  echo "Vite: http://${listeners[0]}"
+  if (( ${#listeners[@]} > 1 )); then
+    local listener
+    for listener in "${listeners[@]:1}"; do
+      echo "Also listening: http://$listener"
+    done
+  fi
+}
+
+run_builtin_status_action() {
+  local manifest_path="$1"
+  local session_name="$2"
+  local status_action
+
+  status_action="$(jq -r '.status_action // empty' "$manifest_path")"
+  if [[ -z "$status_action" || "$status_action" == "null" ]]; then
+    echo "No status action configured for '$session_name'." >&2
+    return 1
+  fi
+
+  case "$status_action" in
+    "vite-bun")
+      run_builtin_status_vite_bun "$session_name"
+      ;;
+    *)
+      echo "Unknown status_action '$status_action' for '$session_name'." >&2
+      return 1
+      ;;
+  esac
+}
+
+run_project_status() {
+  local manifest_path="$1"
+  local project_root="$2"
+  local session_name="$3"
+  local status_command
+
+  status_command="$(jq -r '.status_command // empty' "$manifest_path")"
+  if [[ -n "$status_command" && "$status_command" != "null" ]]; then
+    run_status_command "$manifest_path" "$project_root" "$session_name"
+    return $?
+  fi
+
+  run_builtin_status_action "$manifest_path" "$session_name"
+}
+
+status_all_projects() {
+  local i
+  local manifest_path
+  local project_root
+  local session_name
+  local status_output
+  local ran_any=0
+  local line
+
+  load_projects || return 1
+
+  for i in "${!MANIFESTS[@]}"; do
+    if [[ "${PROJECT_STATES[$i]}" != "open" ]]; then
+      continue
+    fi
+
+    manifest_path="${MANIFESTS[$i]}"
+    session_name="${PROJECT_SESSIONS[$i]}"
+    project_root="$(resolve_project_root "$manifest_path" "${PROJECT_DIRS[$i]}")" || {
+      printf '[%s] invalid root\n' "$session_name"
+      continue
+    }
+
+    if ! status_output="$(run_project_status "$manifest_path" "$project_root" "$session_name" 2>&1)"; then
+      printf '[%s] %s\n' "$session_name" "$status_output"
+      ran_any=1
+      continue
+    fi
+
+    printf '[%s]\n' "$session_name"
+    while IFS= read -r line; do
+      printf '  %s\n' "$line"
+    done <<<"$status_output"
+    ran_any=1
+  done
+
+  if (( ran_any == 0 )); then
+    echo "No running sessions found."
+  fi
+}
+
 setup_window() {
   local session_name="$1"
   local project_root="$2"
@@ -230,7 +560,7 @@ setup_window() {
     # First window creates the session.
     base_pane=$("$TMUX_BIN" new-session -d -s "$session_name" -n "$window_name" -c "$project_root" -P -F '#{pane_id}' "bash")
   else
-    base_pane=$("$TMUX_BIN" new-window -d -t "$session_name" -n "$window_name" -c "$project_root" -P -F '#{pane_id}' "bash")
+    base_pane=$("$TMUX_BIN" new-window -d -t "=$session_name" -n "$window_name" -c "$project_root" -P -F '#{pane_id}' "bash")
   fi
 
   for (( i = 0; i < ${#pane_defs[@]}; i++ )); do
@@ -338,7 +668,7 @@ setup_window() {
   done
 
   if [[ "$layout" != "vertical" && "$layout" != "horizontal" ]]; then
-    "$TMUX_BIN" select-layout -t "$session_name:$window_name" "$layout" || true
+    "$TMUX_BIN" select-layout -t "=$session_name:$window_name" "$layout" || true
   fi
 }
 
@@ -346,57 +676,8 @@ select_project() {
   local query="${1:-}"
 
   # Returns one manifest path on stdout. Selection UI goes to stderr.
-  if [[ ! -f "$TMUX_PROJECT_LIST" ]]; then
-    echo "Project list file not found: $TMUX_PROJECT_LIST" >&2
-    echo "Add .tmuxp project paths there and run again." >&2
-    exit 1
-  fi
-
-  mapfile -t MANIFEST_ENTRIES < <(sed -E 's/[[:space:]]+$//; /^[[:space:]]*($|#)/d; s/^[[:space:]]+//' "$TMUX_PROJECT_LIST")
-  if (( ${#MANIFEST_ENTRIES[@]} == 0 )); then
-    echo "No entries found in project list: $TMUX_PROJECT_LIST" >&2
-    exit 1
-  fi
-
-  mapfile -t MANIFESTS < <(
-    for entry in "${MANIFEST_ENTRIES[@]}"; do
-      resolved="$(resolve_path "$entry")"
-      if [[ "$resolved" == *"/$MANIFEST_NAME" ]]; then
-        echo "$resolved"
-      elif [[ -f "$resolved/$MANIFEST_NAME" ]]; then
-        echo "$resolved/$MANIFEST_NAME"
-      else
-        continue
-      fi
-    done
-  )
-  if (( ${#MANIFESTS[@]} == 0 )); then
-    echo "No readable '$MANIFEST_NAME' manifests in project list: $TMUX_PROJECT_LIST" >&2
-    exit 1
-  fi
-
-  local -a PROJECT_DIRS PROJECT_NAMES PROJECT_SESSIONS PROJECT_STATES
   local i
-  for i in "${!MANIFESTS[@]}"; do
-    local dir
-    local session_name_for_project
-    dir="$(dirname "${MANIFESTS[$i]}")"
-    PROJECT_DIRS[i]="$(cd "$dir" && pwd -P)"
-    PROJECT_NAMES[i]="$(basename "${PROJECT_DIRS[i]}")"
-    session_name_for_project="$(jq -r '.session // empty' "${MANIFESTS[$i]}" 2>/dev/null || true)"
-    if [[ -z "$session_name_for_project" || "$session_name_for_project" == "null" ]]; then
-      session_name_for_project="${PROJECT_NAMES[$i]}"
-    fi
-    PROJECT_SESSIONS[i]="$session_name_for_project"
-    if "$TMUX_BIN" has-session -t "$session_name_for_project" 2>/dev/null; then
-      PROJECT_STATES[i]="open"
-    else
-      PROJECT_STATES[i]="new"
-    fi
-  done
-
-  load_project_state
-  sort_projects_by_recent_launch
+  load_projects || exit 1
 
   if [[ -n "$query" ]]; then
     for i in "${!PROJECT_NAMES[@]}"; do
@@ -458,7 +739,19 @@ select_project() {
   done
 }
 
-SESSION_NAME_FROM_MANIFESTS=$(select_project "${1:-}")
+action="launch"
+query="${1:-}"
+if [[ "${1:-}" == "status" ]]; then
+  action="status"
+  query="${2:-}"
+fi
+
+if [[ "$action" == "status" && -z "$query" ]]; then
+  status_all_projects
+  exit 0
+fi
+
+SESSION_NAME_FROM_MANIFESTS=$(select_project "$query")
 if [[ -z "$SESSION_NAME_FROM_MANIFESTS" ]]; then
   exit 1
 fi
@@ -471,37 +764,30 @@ if [[ -z "$session_name" || "$session_name" == "null" ]]; then
   session_name="$(basename "$project_root")"
 fi
 
-LAUNCH_SESSION_NAME="$session_name"
-SESSION_CREATED=0
-cleanup_bad_session() {
-  if (( SESSION_CREATED == 1 )) && "$TMUX_BIN" has-session -t "$LAUNCH_SESSION_NAME" 2>/dev/null; then
-    "$TMUX_BIN" kill-session -t "$LAUNCH_SESSION_NAME" >/dev/null 2>&1 || true
-  fi
-}
+project_root="$(resolve_project_root "$manifest_path" "$project_root")"
 
-if "$TMUX_BIN" has-session -t "$session_name" 2>/dev/null; then
-  # Fast path: session already exists, just switch/attach.
-  record_project_launch "$manifest_path"
-  if [[ -n "${TMUX:-}" ]]; then
-    "$TMUX_BIN" switch-client -t "$session_name"
-  else
-    "$TMUX_BIN" attach -t "$session_name"
-  fi
+if [[ "$action" == "status" ]]; then
+  run_project_status "$manifest_path" "$project_root" "$session_name"
   exit 0
 fi
 
-configured_root="$(jq -r '.root // empty' "$manifest_path")"
-if [[ -n "$configured_root" && "$configured_root" != "null" ]]; then
-  if [[ "$configured_root" == "~/"* ]]; then
-    configured_root="${HOME}${configured_root#\~}"
-  elif [[ "$configured_root" != /* ]]; then
-    configured_root="$project_root/$configured_root"
+LAUNCH_SESSION_NAME="$session_name"
+SESSION_CREATED=0
+cleanup_bad_session() {
+  if (( SESSION_CREATED == 1 )) && "$TMUX_BIN" has-session -t "=$LAUNCH_SESSION_NAME" 2>/dev/null; then
+    "$TMUX_BIN" kill-session -t "=$LAUNCH_SESSION_NAME" >/dev/null 2>&1 || true
   fi
-  if [[ ! -d "$configured_root" ]]; then
-    echo "Configured root does not exist for '$session_name': $configured_root" >&2
-    exit 1
+}
+
+if "$TMUX_BIN" has-session -t "=$session_name" 2>/dev/null; then
+  # Fast path: session already exists, just switch/attach.
+  record_project_launch "$manifest_path"
+  if [[ -n "${TMUX:-}" ]]; then
+    "$TMUX_BIN" switch-client -t "=$session_name"
+  else
+    "$TMUX_BIN" attach -t "=$session_name"
   fi
-  project_root="$(cd "$configured_root" && pwd -P)"
+  exit 0
 fi
 
 window_count="$(jq '.windows | length' "$manifest_path" 2>/dev/null || echo 0)"
@@ -522,7 +808,7 @@ trap - ERR
 
 record_project_launch "$manifest_path"
 if [[ -n "${TMUX:-}" ]]; then
-  "$TMUX_BIN" switch-client -t "$session_name"
+  "$TMUX_BIN" switch-client -t "=$session_name"
 else
-  "$TMUX_BIN" attach -t "$session_name"
+  "$TMUX_BIN" attach -t "=$session_name"
 fi

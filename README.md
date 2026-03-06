@@ -21,6 +21,7 @@ Runtime requirements: `tmux` and `jq`
 ```bash
 tmux-launch
 tmux-launch <project-name|project-path|session-name>
+tmux-launch status [project-name|project-path|session-name]
 ```
 
 ## Manifest
@@ -41,6 +42,7 @@ tmux-launch <project-name|project-path|session-name>
 {
   "session": "my-project",
   "root": "/absolute/path/to/my-project",
+  "status_action": "vite-bun",
   "windows": [
     {
       "name": "my-project",
@@ -53,3 +55,37 @@ tmux-launch <project-name|project-path|session-name>
   ]
 }
 ```
+
+## Status
+
+`tmux-launch status` with no query reports status for all running sessions in
+recency order.
+
+`tmux-launch status <project>` reports status for one project.
+
+For common projects, prefer a built-in action in `.tmuxp`:
+
+- `status_action: "vite-bun"`: finds the listening port owned by the session's
+  `start` pane process tree and prints a local Vite URL.
+
+For custom projects, use `status_command` instead. If both are present,
+`status_command` wins.
+
+Example custom command:
+
+```json
+{
+  "status_command": "bun run tmux-status"
+}
+```
+
+Custom commands receive these env vars:
+
+- `TMUX_LAUNCH_SESSION`
+- `TMUX_LAUNCH_ROOT`
+- `TMUX_LAUNCH_MANIFEST`
+- `TMUX_LAUNCH_PROJECT_LIST`
+- `TMUX_LAUNCH_PROJECT_STATE_FILE`
+
+Use `status_command` to print anything project-specific, such as API health,
+tunnel URLs, or multi-service output.
