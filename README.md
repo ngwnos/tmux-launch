@@ -2,6 +2,20 @@
 
 Minimal tmux project launcher.
 
+## Install
+
+This installs `tmux-launch`, creates `~/.tmuxp-projects` if it does not exist,
+and removes the downloaded installer when it exits.
+
+```bash
+tmp="$(mktemp)" && wget -qO "$tmp" https://raw.githubusercontent.com/ngwnos/tmux-launch/main/install.sh && bash "$tmp"
+```
+
+The installer picks `~/.local/bin` if it is already on `PATH`, otherwise `~/bin`
+if it is on `PATH`, otherwise it falls back to `~/.local/bin`.
+
+Runtime requirements: `tmux` and `jq`
+
 ## Usage
 
 ```bash
