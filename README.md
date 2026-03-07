@@ -16,6 +16,43 @@ if it is on `PATH`, otherwise it falls back to `~/.local/bin`.
 
 Runtime requirements: `tmux` and `jq`
 
+## Installer Flags
+
+`install.sh` now supports one-shot project setup:
+
+```bash
+bash install.sh \
+  --project-path /absolute/path/to/project \
+  --ensure-entry \
+  --write-default-tmuxp \
+  --non-interactive
+```
+
+Flags:
+
+- `--project-path <dir>`: project directory for manifest/setup actions
+- `--ensure-entry`: ensure project directory exists exactly once in `~/.tmuxp-projects`
+- `--write-default-tmuxp`: create `<project-path>/.tmuxp` if it does not exist
+- `--non-interactive`: fail instead of prompting for missing values
+
+## Uninstall
+
+Repeatable uninstall/reset for testing:
+
+```bash
+bash uninstall.sh \
+  --project-path /absolute/path/to/project \
+  --remove-entry \
+  --remove-default-tmuxp \
+  --non-interactive
+```
+
+This removes:
+
+- installed `tmux-launch` binary
+- project entry from `~/.tmuxp-projects` (if `--remove-entry`)
+- project `.tmuxp` file (if `--remove-default-tmuxp`)
+
 ## Usage
 
 ```bash
