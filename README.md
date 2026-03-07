@@ -11,8 +11,8 @@ and removes the downloaded installer when it exits.
 tmp="$(mktemp)" && wget -qO "$tmp" https://raw.githubusercontent.com/ngwnos/tmux-launch/main/install.sh && bash "$tmp"
 ```
 
-The installer picks `~/.local/bin` if it is already on `PATH`, otherwise `~/bin`
-if it is on `PATH`, otherwise it falls back to `~/.local/bin`.
+The installer picks `~/bin` if it is already on `PATH`, otherwise `~/.local/bin`
+if it is on `PATH`, otherwise it falls back to `~/bin`.
 
 Runtime requirements: `tmux` and `jq`
 

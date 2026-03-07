@@ -94,17 +94,17 @@ choose_install_dir() {
     return 0
   fi
 
-  if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
-    printf '%s\n' "$HOME/.local/bin"
-    return 0
-  fi
-
   if [[ ":$PATH:" == *":$HOME/bin:"* ]]; then
     printf '%s\n' "$HOME/bin"
     return 0
   fi
 
-  printf '%s\n' "$HOME/.local/bin"
+  if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
+    printf '%s\n' "$HOME/.local/bin"
+    return 0
+  fi
+
+  printf '%s\n' "$HOME/bin"
 }
 
 fetch_launcher() {
