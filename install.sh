@@ -62,7 +62,7 @@ die() {
 
 normalize_abs_path() {
   local path="$1"
-  if [[ "$path" == ~/* ]]; then
+  if [[ "$path" == "~/"* ]]; then
     path="${HOME}${path#\~}"
   fi
   if [[ "$path" != /* ]]; then
