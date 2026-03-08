@@ -58,8 +58,13 @@ This removes:
 ```bash
 tmux-launch
 tmux-launch <project-name|project-path|session-name>
+tmux-launch --detached <project-name|project-path|session-name>
 tmux-launch status [project-name|project-path|session-name]
 ```
+
+Flags:
+
+- `-d`, `--detached`, `--no-attach`: create or reuse the target session without attaching or switching clients. Intended for automation.
 
 ## Manifest
 

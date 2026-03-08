@@ -8,6 +8,7 @@ set -euo pipefail
 # Usage:
 #   tmux-launch
 #   tmux-launch <project-name|project-path|session-name>
+#   tmux-launch --detached <project-name|project-path|session-name>
 #   tmux-launch status [project-name|project-path|session-name]
 
 MANIFEST_NAME="${TMUX_PROJECT_MANIFEST:-.tmuxp}"
@@ -23,6 +24,20 @@ if ! command -v jq >/dev/null; then
   echo "jq not found (required to read .tmuxp files)" >&2
   exit 1
 fi
+
+usage() {
+  cat <<'EOF'
+Usage:
+  tmux-launch
+  tmux-launch <project-name|project-path|session-name>
+  tmux-launch --detached <project-name|project-path|session-name>
+  tmux-launch status [project-name|project-path|session-name]
+
+Options:
+  -d, --detached, --no-attach  create/reuse the session without attaching
+  -h, --help                   show this help
+EOF
+}
 
 run_in_pane() {
   local pane_id="$1"
@@ -740,11 +755,60 @@ select_project() {
 }
 
 action="launch"
-query="${1:-}"
-if [[ "${1:-}" == "status" ]]; then
-  action="status"
-  query="${2:-}"
-fi
+query=""
+DETACHED=0
+
+while (( $# > 0 )); do
+  case "$1" in
+    status)
+      if [[ "$action" != "launch" || -n "$query" ]]; then
+        echo "Unexpected status argument position." >&2
+        usage >&2
+        exit 1
+      fi
+      action="status"
+      ;;
+    -d|--detached|--no-attach)
+      DETACHED=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      if (( $# > 0 )); then
+        if [[ -n "$query" ]]; then
+          echo "Too many arguments." >&2
+          usage >&2
+          exit 1
+        fi
+        query="$1"
+        shift
+      fi
+      if (( $# > 0 )); then
+        echo "Too many arguments." >&2
+        usage >&2
+        exit 1
+      fi
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "$query" ]]; then
+        echo "Too many arguments." >&2
+        usage >&2
+        exit 1
+      fi
+      query="$1"
+      ;;
+  esac
+  shift
+done
 
 if [[ "$action" == "status" && -z "$query" ]]; then
   status_all_projects
@@ -782,7 +846,10 @@ cleanup_bad_session() {
 if "$TMUX_BIN" has-session -t "=$session_name" 2>/dev/null; then
   # Fast path: session already exists, just switch/attach.
   record_project_launch "$manifest_path"
-  if [[ -n "${TMUX:-}" ]]; then
+  if (( DETACHED == 1 )); then
+    echo "Session ready: $session_name"
+    echo "Project root: $project_root"
+  elif [[ -n "${TMUX:-}" ]]; then
     "$TMUX_BIN" switch-client -t "=$session_name"
   else
     "$TMUX_BIN" attach -t "=$session_name"
@@ -807,7 +874,10 @@ done
 trap - ERR
 
 record_project_launch "$manifest_path"
-if [[ -n "${TMUX:-}" ]]; then
+if (( DETACHED == 1 )); then
+  echo "Session ready: $session_name"
+  echo "Project root: $project_root"
+elif [[ -n "${TMUX:-}" ]]; then
   "$TMUX_BIN" switch-client -t "=$session_name"
 else
   "$TMUX_BIN" attach -t "=$session_name"
