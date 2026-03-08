@@ -162,7 +162,7 @@ write_default_tmuxp_manifest() {
   cat >"$tmuxp_path" <<EOF
 {
   "session": "$session_name",
-  "root": "$project_dir",
+  "root": ".",
   "status_action": "vite-bun",
   "windows": [
     {

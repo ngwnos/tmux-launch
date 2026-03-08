@@ -69,6 +69,7 @@ tmux-launch status [project-name|project-path|session-name]
 - Each entry is either:
 - absolute path to a `.tmuxp` file
 - project directory containing `.tmuxp`
+- the project list is local machine state; repo-level `.tmuxp` files can stay portable
 - `tmux-launch` keeps the manifest as a plain list and stores last-launched
   timestamps in the separate state file so the picker can sort projects by
   recency.
@@ -78,7 +79,7 @@ tmux-launch status [project-name|project-path|session-name]
 ```json
 {
   "session": "my-project",
-  "root": "/absolute/path/to/my-project",
+  "root": ".",
   "status_action": "vite-bun",
   "windows": [
     {
@@ -93,6 +94,9 @@ tmux-launch status [project-name|project-path|session-name]
 }
 ```
 
+`"root": "."` keeps the project manifest portable. You can also omit `root`
+entirely and `tmux-launch` will use the manifest's parent directory.
+
 ## Status
 
 `tmux-launch status` with no query reports status for all running sessions in
@@ -104,6 +108,9 @@ For common projects, prefer a built-in action in `.tmuxp`:
 
 - `status_action: "vite-bun"`: finds the listening port owned by the session's
   `start` pane process tree and prints a local Vite URL.
+
+`vite-bun` currently relies on `ss`, so it is most reliable on Linux. On other
+systems, prefer `status_command` for project-specific status output.
 
 For custom projects, use `status_command` instead. If both are present,
 `status_command` wins.

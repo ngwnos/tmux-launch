@@ -13,7 +13,7 @@
 # Example `.tmuxp` content:
 # {
 #   "session": "<your-project-name>",
-#   "root": "<absolute-path-to-your-project>",
+#   "root": ".",
 #   "status_action": "vite-bun",
 #   "windows": [
 #     {
